@@ -13,4 +13,7 @@
     <string name="type_a_message">Введите сообщение</string>
     <string name="send">Отправить</string>
     <string name="new_message">Новое сообщение</string>
+
+    <string name="channel_name">Мой секретный чат</string>
+    <string name="channel_description">Канал уведомлений для секретного чата</string>
 </resources>
