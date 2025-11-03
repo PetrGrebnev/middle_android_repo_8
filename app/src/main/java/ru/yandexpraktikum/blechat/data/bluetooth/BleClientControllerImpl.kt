@@ -1,7 +1,13 @@
 package ru.yandexpraktikum.blechat.data.bluetooth
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCallback
+import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattService
+import android.bluetooth.BluetoothProfile
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.content.Context
@@ -16,9 +22,16 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import ru.yandexpraktikum.blechat.R
 import ru.yandexpraktikum.blechat.domain.bluetooth.BleClientController
+import ru.yandexpraktikum.blechat.domain.model.Message
 import ru.yandexpraktikum.blechat.domain.model.ScannedBluetoothDevice
+import ru.yandexpraktikum.blechat.presentation.notifications.NotificationsHelper
 import ru.yandexpraktikum.blechat.utils.checkForConnectPermission
+import ru.yandexpraktikum.blechat.utils.notifyCharUUID
+import ru.yandexpraktikum.blechat.utils.serviceUUID
+import ru.yandexpraktikum.blechat.utils.writeCharUUID
 import javax.inject.Inject
 
 class BleClientControllerImpl @Inject constructor(
@@ -26,7 +39,8 @@ class BleClientControllerImpl @Inject constructor(
     private val bluetoothAdapter: BluetoothAdapter?,
     private val locationManager: LocationManager,
     private val viewModelScope: CoroutineScope,
-): BleClientController {
+    private val notificationsHelperImpl: NotificationsHelper
+) : BleClientController {
 
     private val bleScanner by lazy {
         bluetoothAdapter?.bluetoothLeScanner
@@ -40,6 +54,82 @@ class BleClientControllerImpl @Inject constructor(
     override val isLocationEnabled: StateFlow<Boolean>
         get() = _isLocationEnabled.asStateFlow()
 
+    private var bleGatt: BluetoothGatt? = null
+    private var serviceGatt: BluetoothGattService? = null
+
+    private val bleGattCallback: BluetoothGattCallback = object : BluetoothGattCallback() {
+
+        override fun onConnectionStateChange(gatt: BluetoothGatt?, status: Int, newState: Int) {
+            context.checkForConnectPermission {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    when (newState) {
+                        BluetoothProfile.STATE_CONNECTED -> {
+                            gatt?.discoverServices()
+                            _scannedDevices.update { devices ->
+                                devices.map {
+                                    if (it.address == gatt?.device?.address) {
+                                        it.copy(isConnected = true)
+                                    } else it
+                                }
+                            }
+                        }
+
+                        BluetoothProfile.STATE_DISCONNECTED -> {
+                            _scannedDevices.update { devices ->
+                                devices.map {
+                                    if (it.address == gatt?.device?.address) {
+                                        it.copy(isConnected = false)
+                                    } else it
+                                }
+                            }
+                            closeConnection()
+                        }
+                    }
+                }
+            }
+        }
+
+        override fun onServicesDiscovered(gatt: BluetoothGatt?, status: Int) {
+            context.checkForConnectPermission {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    serviceGatt = gatt?.getService(serviceUUID)
+                    serviceGatt?.getCharacteristic(notifyCharUUID)?.let {
+                        gatt?.setCharacteristicNotification(it, true)
+                    }
+                }
+            }
+        }
+
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic
+        ) {
+            context.checkForConnectPermission {
+                if (characteristic.uuid == notifyCharUUID) {
+                    val message = String(characteristic.value).trim()
+                    notificationsHelperImpl.notifyOnMessageReceived(
+                        context.getString(R.string.new_message),
+                        message = message
+                    )
+                    viewModelScope.launch {
+                        _scannedDevices.update { devices ->
+                            devices.map {
+                                if (it.address == gatt.device.address) {
+                                    it.copy(
+                                        messages = it.messages + Message(
+                                            text = message,
+                                            senderAddress = it.address,
+                                            isFromLocalUser = false
+                                        )
+                                    )
+                                } else it
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     init {
         updateBluetoothState()
@@ -58,7 +148,10 @@ class BleClientControllerImpl @Inject constructor(
 
     override fun updateLocationState() {
         try {
-            _isLocationEnabled.value = locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER) || locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
+            _isLocationEnabled.value =
+                locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER) || locationManager.isProviderEnabled(
+                    LocationManager.NETWORK_PROVIDER
+                )
         } catch (e: Exception) {
             Log.e("BLE", "Failed to initialize Location state", e)
         }
@@ -146,15 +239,44 @@ class BleClientControllerImpl @Inject constructor(
     }
 
     override fun connectToDevice(device: ScannedBluetoothDevice): Boolean {
-        TODO()
+        context.checkForConnectPermission {
+            viewModelScope.launch {
+                val remoteDevice = bluetoothAdapter?.getRemoteDevice(device.address)
+                bleGatt = remoteDevice?.connectGatt(context, false, bleGattCallback)
+            }
+        }
+        return bleGatt != null
     }
 
+    @SuppressLint("MissingPermission")
     override suspend fun sendMessage(message: String, deviceAddress: String): Boolean {
-        TODO()
+        return bleGatt?.let { gatt ->
+            serviceGatt?.getCharacteristic(writeCharUUID)?.let { character ->
+                character.value = message.toByteArray()
+                gatt.writeCharacteristic(character)
+                viewModelScope.launch {
+                    _scannedDevices.update { devices ->
+                        devices.map {
+                            if (it.address == deviceAddress) {
+                                it.copy(
+                                    messages = it.messages + Message(
+                                        text = message,
+                                        senderAddress = bluetoothAdapter?.address ?: "",
+                                        isFromLocalUser = true
+                                    )
+                                )
+                            } else it
+                        }
+                    }
+                }
+                true
+            } ?: false
+        } ?: false
     }
 
     override fun closeConnection() {
-        TODO()
+        bleGatt = null
+        serviceGatt = null
     }
 
     override fun release() {
